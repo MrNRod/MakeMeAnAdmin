@@ -1,5 +1,5 @@
 # MakeMeAnAdmin (SwiftDialog Edition)
-Repo: [https://gitlab.com/mrnrod45/MakeMeAnAdmin.git](https://gitlab.com/mrnrod45/MakeMeAnAdmin.git)
+Repo: [https://github.com/MrNRod/MakeMeAnAdmin.git](https://github.com/MrNRod/MakeMeAnAdmin.git)
 
 A modernized, vendor-agnostic fork of [Jamf's MakeMeAnAdmin](https://github.com/jamf/MakeMeAnAdmin), tailored for use with **Workspace ONE**, **Jamf Pro**, or any MDM capable of script deployment. This version integrates [SwiftDialog](https://github.com/bartreardon/swiftDialog) for a user-friendly interface and supports automatic installation of SwiftDialog if not already present.
 
@@ -47,7 +47,7 @@ The script uses a flexible configuration system that prioritizes:
 
 | Variable | Jamf Param | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `companyName` | `$4` | Organization identifier (used in LaunchDaemon filenames). Avoid spaces if possible. | `mrnrod45` |
+| `companyName` | `$4` | Organization identifier (used in LaunchDaemon filenames). Avoid spaces if possible. | `MrNRod` |
 | `companyLogo` | `$5` | Absolute path to a branding icon/logo. | `""` (Empty) |
 | `allowDialogInstall` | `$6` | Auto-install SwiftDialog if missing? (`true`/`false`) | `true` |
 
@@ -55,7 +55,7 @@ The script uses a flexible configuration system that prioritizes:
 If not using an MDM that passes parameters, you can edit the defaults at the top of the script:
 
 ```bash
-companyName="${4:-"${companyName:-"mrnrod45"}"}"
+companyName="${4:-"${companyName:-"MrNRod"}"}"
 companyLogo="${5:-"${companyLogo:-"/path/to/logo.png"}"}"
 allowDialogInstall="${6:-"${allowDialogInstall:-"true"}"}"
 ```

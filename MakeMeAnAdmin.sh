@@ -17,7 +17,7 @@
 # Variable Initialization
 # Logic: Check Jamf Script Parameter ($4-$6) -> Check Environment Variable -> Default Value
 # This single line handles both Jamf Pro (parameters) and Workspace ONE (script variables/environment vars).
-companyName="${4:-"${companyName:-"mrnrod45"}"}"
+companyName="${4:-"${companyName:-"MrNRod"}"}"
 companyLogo="${5:-"${companyLogo:-""}"}"
 allowDialogInstall="${6:-"${allowDialogInstall:-"true"}"}"
 
