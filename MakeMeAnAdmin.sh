@@ -1,297 +1,597 @@
 #!/bin/bash
 
-###############################################
-# This script will provide temporary admin    #
-# rights to a standard user right from self   #
-# service. First it will grab the username of #
-# the logged in user, elevate them to admin   #
-# and then create a launch daemon that will   #
-# count down from the selected time and then  #
-# create and run a secondary script that will #
-# demote the user back to a standard account. #
-# The launch daemon will continue to count    #
-# down no matter how often the user logs out  #
-# or restarts their computer.                 #
-###############################################
+###############################################################################
+# MakeMeAnAdmin (SwiftDialog Edition)
+#
+# Grants the logged-in standard user temporary admin rights, then removes them
+# automatically. Run as root from an MDM (Jamf Pro, Workspace ONE, ...).
+#
+# Modes (first argument, or $8 / $mode):
+#   request   (default) prompt the user, grant admin, arm the demotion daemon
+#   enforce   MDM backstop: re-arm the daemon if it was tampered with and
+#             demote immediately if the grant has expired. Safe to run on a
+#             recurring MDM schedule (it does nothing when no grant exists).
+#   preview   show the dialogs only (no root, no changes) - for testing branding
+#
+# SwiftDialog is a REQUIREMENT, not something this script installs. Deploy it
+# with your MDM before this script (see ReadMe.md for why).
+###############################################################################
 
-# Variable Initialization
-# Logic: Check Jamf Script Parameter ($4-$6) -> Check Environment Variable -> Default Value
-# This single line handles both Jamf Pro (parameters) and Workspace ONE (script variables/environment vars).
-companyName="${4:-"${companyName:-"MrNRod"}"}"
-companyLogo="${5:-"${companyLogo:-""}"}"
-allowDialogInstall="${6:-"${allowDialogInstall:-"true"}"}"
+# Fixed PATH: nothing below should resolve through a caller-supplied PATH.
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+umask 022
+set -u
 
-######################################################
-# Create a directory to store the MakeMeAnAdmin logs   #
-######################################################
+#------------------------------------------------------------------------------
+# Configuration
+# Order of precedence: MDM script parameter -> environment variable -> default
+# ($6 was "allowDialogInstall" in older versions; it is ignored now.)
+#------------------------------------------------------------------------------
+case "${1:-}" in
+    request|enforce|preview) mode="$1" ;;
+    *) mode="${8:-${mode:-request}}" ;;
+esac
+companyName="${4:-${companyName:-MrNRod}}"
+companyLogo="${5:-${companyLogo:-}}"
+companyLogoDark="${7:-${companyLogoDark:-}}"
 
+durationOptions="30 minutes,1 hour,2 hours,4 hours,8 hours,1 day,1 week"
+defaultDuration="1 hour"
+promptTimeout=300            # seconds before an unanswered prompt closes
+
+# SwiftDialog (required). Always called by absolute path inside the root-owned
+# app bundle - never via PATH or /usr/local/bin (which can be user-writable).
+dialogApp="/Library/Application Support/Dialog/Dialog.app"
+dialogBin="$dialogApp/Contents/MacOS/dialogcli"
+dialogTeamID="PWA5E9TQ59"
+
+# Dialog geometry. The logo is sized by WIDTH ("--iconsize"), height follows
+# the image's aspect ratio, and the window height is exact, so both are
+# computed from the logo's shape (see compute_layout).
+winWidth=500
+logoMaxW=380                 # widest a logo is drawn (pt); the window caps this at 80% of its width
+logoMaxH=110                 # tallest a logo is drawn (pt)
+logoUnknown=120              # size used when the logo's shape can't be read
+
+#------------------------------------------------------------------------------
+# Paths
+#------------------------------------------------------------------------------
 logDir="/Library/Logs/MakeMeAnAdmin"
-mkdir -p "$logDir"
-chmod 755 "$logDir"
-
 logFile="$logDir/MakeMeAnAdminEvents.log"
 archiveFile="$logDir/MakeMeAnAdminEvents_Archive.csv"
-
-######################################################
-# Create a directory to store the MakeMeAnAdmin files  #
-######################################################
-
 persist_dir="/Library/Application Support/MakeMeAnAdmin"
-mkdir -p "$persist_dir"
-chmod 755 "$persist_dir"
+stateFile="$persist_dir/state"
+lastSeenFile="$persist_dir/lastSeen"
+snapshotFile="$persist_dir/adminSnapshot"
+helperScript="$persist_dir/checkAdminExpiry.sh"
+sudoLog="/var/log/sudo_admin.log"
+sudoersFile="/etc/sudoers.d/admin_logging"
 
-expiryFile="$persist_dir/adminExpireAt"
-elevationTimestampFile="$persist_dir/adminStartTime"
+#------------------------------------------------------------------------------
+# Helpers
+#------------------------------------------------------------------------------
+say() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
+    /usr/bin/logger -t MakeMeAnAdmin "$*" 2>/dev/null
+}
 
-#############################################
-# find the logged in user and let them know #
-#############################################
+die() {
+    say "ERROR: $*"
+    exit 1
+}
 
-currentUser=$(who | awk '/console/{print $1}')
-echo $currentUser
+csv() { local s="${1//\"/\"\"}"; printf '"%s"' "$s"; }
 
-######################################
-# Check if SwiftDialog is installed  #
-######################################
+is_admin() { /usr/sbin/dseditgroup -o checkmember -m "$1" admin 2>/dev/null | /usr/bin/grep -q '^yes'; }
 
-if ! command -v dialog &> /dev/null; then
-    if [ "$allowDialogInstall" = "true" ]; then
-        echo "SwiftDialog not found. Installing..."
+log_event() { # user event duration commands
+    local host ts
+    host=$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || /bin/hostname -s)
+    ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+    [ -f "$logFile" ] || echo "timestamp,hostname,user,event,duration,command" > "$logFile"
+    echo "$(csv "$ts"),$(csv "$host"),$(csv "$1"),$(csv "$2"),$(csv "$3"),$(csv "${4:-}")" >> "$logFile"
+    chmod 640 "$logFile"
+    say "event=$2 user=$1 duration=$3"
+}
 
-        # Fetch latest SwiftDialog .pkg URL from GitHub
-        pkg_url=$(curl -s https://api.github.com/repos/swiftDialog/swiftDialog/releases/latest \
-            | grep 'browser_download_url' \
-            | grep '.pkg' \
-            | awk -F'"' '{print $4}' \
-            | grep "dialog-.*\.pkg$" \
-            | head -n 1)
-
-        # Download latest SwiftDialog package
-        temp_pkg="/tmp/SwiftDialog.pkg"
-        curl -Ls -o "$temp_pkg" "$pkg_url"
-
-        # Install it
-        installer -pkg "$temp_pkg" -target /
-
-        #Clean up
-        rm -f "$temp_pkg"
-
-        # Verify again
-        if ! command -v dialog &> /dev/null; then
-            echo "Failed to install SwiftDialog"
-            exit 1
-        fi
-    else
-        echo "SwiftDialog not found and auto-install is disabled."
-        exit 1
+rotate_log() {
+    local size
+    [ -f "$logFile" ] || return 0
+    size=$(stat -f%z "$logFile" 2>/dev/null || echo 0)
+    if [ "$size" -ge 1000000 ]; then
+        # keep the header only once in the archive
+        if [ -f "$archiveFile" ]; then tail -n +2 "$logFile" >> "$archiveFile"; else cp "$logFile" "$archiveFile"; fi
+        echo "timestamp,hostname,user,event,duration,command" > "$logFile"
+        chmod 640 "$logFile" "$archiveFile"
     fi
+}
+
+duration_seconds() {
+    case "$1" in
+        "30 minutes") echo 1800 ;;
+        "1 hour")     echo 3600 ;;
+        "2 hours")    echo 7200 ;;
+        "4 hours")    echo 14400 ;;
+        "8 hours")    echo 28800 ;;
+        "1 day")      echo 86400 ;;
+        "1 week")     echo 604800 ;;
+        *)            return 1 ;;   # anything not on the list is rejected
+    esac
+}
+
+#------------------------------------------------------------------------------
+# Validate configuration (company name ends up in file names and plist XML)
+#------------------------------------------------------------------------------
+if ! [[ "$companyName" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "companyName '$companyName' may only contain letters, digits, '.', '_' and '-'."
+fi
+case "$mode" in request|enforce|preview) ;; *) die "Unknown mode '$mode' (request|enforce|preview)." ;; esac
+
+daemonLabel="com.${companyName}.adminExpiryCheck"
+daemonPlist="/Library/LaunchDaemons/${daemonLabel}.plist"
+lockDir="/var/run/${daemonLabel}.lock"
+
+if [ "$mode" != "preview" ] && [ "$(id -u)" -ne 0 ]; then
+    die "Must run as root (use 'preview' mode to test the dialogs without root)."
 fi
 
-###########################################
-# prompt user to select admin time limit #
-###########################################
+#------------------------------------------------------------------------------
+# Console user (never root / loginwindow)
+#------------------------------------------------------------------------------
+consoleUser=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null)
+case "$consoleUser" in
+    ""|root|loginwindow|_mbsetupuser) consoleUser="" ;;
+esac
+if [ "$mode" = "preview" ] && [ -z "$consoleUser" ]; then consoleUser=$(id -un); fi
+if [ -n "$consoleUser" ] && ! [[ "$consoleUser" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "Unexpected console user name."
+fi
+consoleUID=""
+[ -n "$consoleUser" ] && consoleUID=$(id -u "$consoleUser" 2>/dev/null)
 
-timeChoice=$(dialog \
---title "Make Me Admin" \
---titlefont size=25 \
---icon ${companyLogo} \
---iconsize 250 \
---centericon \
---message "Select how long you need admin access:" \
---alignment center \
---selecttitle "Duration" \
---selectvalues "30 minutes,1 hour,2 hours,4 hours,8 hours,1 day,1 week" \
---button1text "Request" \
---button2text "Cancel" \
---height 300 \
---width 450)
+run_as_user() {
+    if [ "$(id -u)" -eq 0 ]; then
+        /bin/launchctl asuser "$consoleUID" /usr/bin/sudo -u "$consoleUser" "$@"
+    else
+        "$@"
+    fi
+}
 
-# extract value (SwiftDialog returns 'SelectedOption: <value>')
-timeChoice=$(echo "$timeChoice" | awk -F': ' '/SelectedOption/ {print $2}')
+#------------------------------------------------------------------------------
+# SwiftDialog: required, verified, never installed from here
+#------------------------------------------------------------------------------
+verify_dialog() {
+    [ -x "$dialogBin" ] || return 1
+    /usr/bin/codesign --verify --strict "$dialogApp" >/dev/null 2>&1 || return 1
+    /usr/bin/codesign -dv "$dialogApp" 2>&1 | /usr/bin/grep -q "^TeamIdentifier=$dialogTeamID\$"
+}
 
-if [ -z "$timeChoice" ]; then
-    echo "User canceled admin request."
+#------------------------------------------------------------------------------
+# Logo layout: choose icon size + window height from the logo's aspect ratio
+#------------------------------------------------------------------------------
+logo_arg=""      # value for --icon
+logoSize=$logoUnknown
+logoHeight=$logoUnknown
+
+compute_layout() {
+    local logo="$companyLogo" w="" h="" raster=0 out vb
+
+    # fall back to a built-in symbol if the logo is unset / unreadable by the user
+    if [ -z "$logo" ]; then
+        logo_arg="SF=lock.shield"
+    elif [[ "$logo" == http://* || "$logo" == https://* || "$logo" == SF=* ]]; then
+        logo_arg="$logo"
+    elif run_as_user /bin/test -r "$logo" 2>/dev/null; then
+        logo_arg="$logo"
+        out=$(run_as_user /usr/bin/sips -g pixelWidth -g pixelHeight "$logo" 2>/dev/null)
+        w=$(echo "$out" | /usr/bin/awk '/pixelWidth/{print $2}')
+        h=$(echo "$out" | /usr/bin/awk '/pixelHeight/{print $2}')
+        case "$logo" in *.svg|*.SVG) raster=0 ;; *) raster=1 ;; esac
+    else
+        say "WARN: logo '$logo' is not readable by $consoleUser; using the default icon."
+        logo_arg="SF=lock.shield"
+    fi
+
+    # optional dark-mode variant (SwiftDialog "light:dark=" syntax)
+    if [ -n "$companyLogoDark" ] && [ "$logo_arg" != "SF=lock.shield" ] && run_as_user /bin/test -r "$companyLogoDark" 2>/dev/null; then
+        logo_arg="${logo_arg}:dark=${companyLogoDark}"
+    fi
+
+    # Size: wide logos are limited by width, square/tall logos by height.
+    #   n = min(logoMaxW, logoMaxH * max(ratio,1)); never upscale a raster past 1x.
+    if [[ "$w" =~ ^[0-9]+(\.[0-9]+)?$ && "$h" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        set -- $(/usr/bin/awk -v w="$w" -v h="$h" -v mw="$logoMaxW" -v mh="$logoMaxH" -v raster="$raster" '
+            BEGIN {
+                if (w <= 0 || h <= 0) { print 0, 0; exit }
+                r = w / h; rr = (r > 1) ? r : 1
+                n = mh * rr; if (n > mw) n = mw
+                if (raster && w < n) n = w
+                if (n < 32) n = 32
+                ht = (r >= 1) ? n / r : n
+                printf "%d %d\n", n + 0.5, ht + 0.5
+            }')
+        if [ "${1:-0}" -gt 0 ]; then logoSize=$1; logoHeight=$2; fi
+    fi
+
+    # ~290pt for title, message, dropdown and buttons, plus the logo. Spare
+    # room is harmless (spacers); too little would squeeze the logo.
+    winHeight=$(( 290 + logoHeight ))
+    [ "$winHeight" -lt 350 ] && winHeight=350
+    [ "$winHeight" -gt 480 ] && winHeight=480
+}
+
+dialog_ui() { # extra dialog args...
+    run_as_user "$dialogBin" \
+        --title "Make Me Admin" --titlefont size=25 \
+        --icon "$logo_arg" --iconsize "$logoSize" --iconalttext "$companyName logo" --centericon \
+        --messagefont size=16 --alignment center \
+        --width "$winWidth" --height "$winHeight" \
+        --ontop --moveable \
+        "$@"
+}
+
+show_message() { # message
+    dialog_ui --message "$1" --button1text "OK" >/dev/null 2>&1
+}
+
+# prints the selected option; returns 1 if the user cancelled / timed out
+prompt_duration() {
+    local out rc choice
+    out=$(dialog_ui \
+        --message "Select how long you need admin access:\n\nRights are removed automatically when time is up." \
+        --selecttitle "Duration" --selectvalues "$durationOptions" --selectdefault "$defaultDuration" \
+        --button1text "Request" --button2text "Cancel" \
+        --timer "$promptTimeout" --hidetimerbar 2>/dev/null)
+    rc=$?
+    [ "$rc" -eq 0 ] || return 1
+    # Output looks like:  "SelectedOption" : "1 hour"   (older versions: SelectedOption: 1 hour)
+    choice=$(echo "$out" | /usr/bin/sed -n 's/^ *"\{0,1\}SelectedOption"\{0,1\} *: *"\{0,1\}\(.*[^"]\)"\{0,1\} *$/\1/p' | head -n 1)
+    [ -n "$choice" ] || return 1
+    echo "$choice"
+}
+
+format_expiry() { # epoch seconds
+    if [ "$2" -ge 86400 ]; then date -r "$1" '+%A %b %-d at %-I:%M %p'; else date -r "$1" '+%-I:%M %p'; fi
+}
+
+#------------------------------------------------------------------------------
+# Preview mode: dialogs only
+#------------------------------------------------------------------------------
+if [ "$mode" = "preview" ]; then
+    verify_dialog || die "SwiftDialog $dialogTeamID not found/valid at '$dialogApp'."
+    compute_layout
+    say "preview: logo='$logo_arg' iconsize=$logoSize logoHeight=$logoHeight window=${winWidth}x${winHeight}"
+    if choice=$(prompt_duration); then
+        show_message "You now have administrative rights for **$choice**.\n\nThis is a preview - nothing was changed."
+    fi
     exit 0
 fi
 
-# convert time choice to seconds
-case "$timeChoice" in
-    "30 minutes") interval=1800 ;;
-    "1 hour")     interval=3600 ;;
-    "2 hours")    interval=7200 ;;
-    "4 hours")    interval=14400 ;;
-    "8 hours")    interval=28800 ;;
-    "1 day")      interval=86400 ;;
-    "1 week")     interval=604800 ;;
-    *)            interval=1800 ;; # default fallback
-esac
+#------------------------------------------------------------------------------
+# Directories (root-owned; chflags cleared so a re-run can replace files)
+#------------------------------------------------------------------------------
+unlock_artifacts() { /usr/bin/chflags noschg "$helperScript" "$daemonPlist" 2>/dev/null; return 0; }
+lock_artifacts()   { /usr/bin/chflags schg "$helperScript" "$daemonPlist" 2>/dev/null; return 0; }
 
-# Write expiration timestamp to file
-expiryEpoch=$(($(date +%s) + $interval))
-echo "$expiryEpoch" > "$expiryFile"
-chmod 644 "$expiryFile"
+for d in "$logDir" "$persist_dir"; do
+    [ -L "$d" ] && die "$d is a symlink; refusing to continue."
+    mkdir -p "$d" || die "Cannot create $d"
+    chown root:wheel "$d"
+    chmod 755 "$d"
+done
 
-# Notify user using SwiftDialog instead of AppleScript
-dialog \
---title "Access Granted" \
---titlefont size=25 \
---icon ${companyLogo} \
---iconsize 250 \
---centericon \
---message "You now have administrative rights for $timeChoice. DO NOT ABUSE THIS PRIVILEGE." \
---messagefont size=17 \
---alignment center \
---height 300 \
---width 450 \
---button1text "OK"
+# single instance
+if ! mkdir "$lockDir" 2>/dev/null; then
+    oldpid=$(cat "$lockDir/pid" 2>/dev/null)
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        say "Another MakeMeAnAdmin run is in progress (pid $oldpid)."
+        exit 0
+    fi
+    rm -rf "$lockDir"; mkdir "$lockDir" || die "Cannot take lock."
+fi
+echo $$ > "$lockDir/pid"
 
-#########################################################
-# write a daemon that will let you remove the privilege #
-# with another script and chmod/chown to make 			    #
-# sure it'll run, then load it and it will demote user  #
-# when timer ends											                  #
-#########################################################
+provisioning=0
+grantedUser=""
+cleanup_exit() {
+    if [ "$provisioning" -eq 1 ]; then
+        say "Interrupted before the grant was fully armed - rolling back."
+        rollback
+    fi
+    rm -rf "$lockDir"
+}
+trap cleanup_exit EXIT
+trap 'exit 1' INT TERM HUP
 
-cat > /Library/LaunchDaemons/com.${companyName}.adminExpiryCheck.plist <<EOF
+rotate_log
+
+#------------------------------------------------------------------------------
+# State helpers
+#------------------------------------------------------------------------------
+state_get() { /usr/bin/awk -F= -v k="$1" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$stateFile" 2>/dev/null; }
+
+remove_artifacts() {
+    unlock_artifacts
+    /bin/launchctl bootout "system/$daemonLabel" 2>/dev/null
+    rm -f "$stateFile" "$lastSeenFile" "$snapshotFile" "$helperScript" "$daemonPlist"
+}
+
+rollback() {
+    [ -n "$grantedUser" ] && /usr/sbin/dseditgroup -o edit -d "$grantedUser" -t user admin >/dev/null 2>&1
+    remove_artifacts
+    provisioning=0
+}
+
+#------------------------------------------------------------------------------
+# The demotion helper, run by launchd as root every 60s and at boot.
+# Variables are baked in from this script, then the (quoted) body is appended,
+# so nothing in the body is expanded at generation time.
+#------------------------------------------------------------------------------
+write_helper() {
+    local tmp
+    tmp=$(mktemp "$persist_dir/.helper.XXXXXX") || die "mktemp failed"
+    {
+        echo '#!/bin/bash'
+        echo '# Generated by MakeMeAnAdmin.sh - do not edit; it is regenerated on every run.'
+        printf 'LABEL=%q\n'     "$daemonLabel"
+        printf 'PLIST=%q\n'     "$daemonPlist"
+        printf 'STATE=%q\n'     "$stateFile"
+        printf 'LASTSEEN=%q\n'  "$lastSeenFile"
+        printf 'SNAPSHOT=%q\n'  "$snapshotFile"
+        printf 'SELF=%q\n'      "$helperScript"
+        printf 'LOGFILE=%q\n'   "$logFile"
+        printf 'SUDOLOG=%q\n'   "$sudoLog"
+        cat <<'HELPER_BODY'
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+umask 022
+MAX_SECONDS=604800        # no valid grant is longer than a week
+CLOCK_SLACK=120           # tolerated backwards clock step (NTP corrections)
+
+csv() { local s="${1//\"/\"\"}"; printf '"%s"' "$s"; }
+is_admin() { /usr/sbin/dseditgroup -o checkmember -m "$1" admin 2>/dev/null | /usr/bin/grep -q '^yes'; }
+get() { /usr/bin/awk -F= -v k="$1" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$STATE" 2>/dev/null; }
+
+log_event() { # user event duration commands
+    local host ts
+    host=$(/usr/sbin/scutil --get LocalHostName 2>/dev/null || /bin/hostname -s)
+    ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+    [ -f "$LOGFILE" ] || echo "timestamp,hostname,user,event,duration,command" > "$LOGFILE"
+    echo "$(csv "$ts"),$(csv "$host"),$(csv "$1"),$(csv "$2"),$(csv "$3"),$(csv "${4:-}")" >> "$LOGFILE"
+    chmod 640 "$LOGFILE"
+    /usr/bin/logger -t MakeMeAnAdmin "event=$2 user=$1 ${4:+detail=$4}"
+}
+
+teardown() {
+    /usr/bin/chflags noschg "$SELF" "$PLIST" 2>/dev/null
+    rm -f "$STATE" "$LASTSEEN" "$SNAPSHOT" "$SELF" "$PLIST"
+    /bin/launchctl bootout "system/$LABEL" 2>/dev/null   # last: this stops us
+}
+
+demote() {
+    local i
+    for i in 1 2 3; do
+        /usr/sbin/dseditgroup -o edit -d "$1" -t user admin >/dev/null 2>&1
+        is_admin "$1" || return 0
+        sleep 2
+    done
+    return 1
+}
+
+main() {
+    local now user start expiry duration offset last reason size cmds current extra
+
+    if [ ! -f "$STATE" ]; then teardown; return 0; fi   # no grant -> nothing should be armed
+
+    now=$(date +%s)
+    user=$(get user); start=$(get start); expiry=$(get expiry)
+    duration=$(get duration); offset=$(get sudoOffset)
+    last=$(cat "$LASTSEEN" 2>/dev/null)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+
+    reason=""
+    if ! [[ "$user" =~ ^[A-Za-z0-9._-]+$ && "$start" =~ ^[0-9]+$ && "$expiry" =~ ^[0-9]+$ ]]; then
+        reason="state-corrupt"
+    elif [ "$expiry" -le "$start" ] || [ $((expiry - start)) -gt "$MAX_SECONDS" ]; then
+        reason="state-tampered"
+    elif [ "$now" -ge "$expiry" ]; then
+        reason="expired"
+    elif [ "$last" -gt $((now + CLOCK_SLACK)) ]; then
+        reason="clock-rewound"        # fail closed: wall clock moved backwards
+    fi
+
+    if [ -z "$reason" ]; then
+        [ "$now" -gt "$last" ] && echo "$now" > "$LASTSEEN"
+        return 0
+    fi
+
+    # Without a trustworthy user name there is nobody safe to demote.
+    if ! [[ "$user" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        log_event "unknown" "state-invalid" "" "$reason"
+        teardown; return 0
+    fi
+
+    if ! demote "$user"; then
+        log_event "$user" "demote-failed" "$duration" "$reason (will retry)"
+        return 1                       # keep the daemon armed; launchd retries
+    fi
+
+    # Commands the user ran through sudo during the window (byte offset recorded at grant)
+    cmds=""
+    if [ -f "$SUDOLOG" ] && [[ "$offset" =~ ^[0-9]+$ ]]; then
+        size=$(stat -f%z "$SUDOLOG" 2>/dev/null || echo 0)
+        [ "$size" -lt "$offset" ] && offset=0
+        cmds=$(tail -c "+$((offset + 1))" "$SUDOLOG" 2>/dev/null | /usr/bin/grep -F -- " : $user : " | tr '\n' ';' | head -c 8000)
+    fi
+    log_event "$user" "demoted" "$duration" "reason=$reason; ${cmds}"
+
+    # Anyone newly added to admin during the window (e.g. a backdoor account)?
+    if [ -f "$SNAPSHOT" ]; then
+        current=$(dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership: *//' | tr ' ' '\n' | /usr/bin/grep -v '^$' | sort)
+        extra=$(comm -13 <(sort "$SNAPSHOT") <(echo "$current") | /usr/bin/grep -vx -- "$user" | tr '\n' ' ')
+        [ -n "$extra" ] && log_event "$user" "unexpected-admin-added" "" "$extra"
+    fi
+
+    teardown
+    return 0
+}
+
+main "$@"
+exit $?
+HELPER_BODY
+    } > "$tmp"
+    chown root:wheel "$tmp"; chmod 755 "$tmp"
+    mv -f "$tmp" "$helperScript"
+}
+
+write_daemon() {
+    local tmp
+    tmp=$(mktemp "$persist_dir/.plist.XXXXXX") || die "mktemp failed"
+    cat > "$tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.${companyName}.adminExpiryCheck</string>
+    <string>${daemonLabel}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$persist_dir/checkAdminExpiry.sh</string>
+        <string>/bin/bash</string>
+        <string>${helperScript}</string>
     </array>
     <key>StartInterval</key>
-    <integer>300</integer>
+    <integer>60</integer>
     <key>RunAtLoad</key>
     <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
 </dict>
 </plist>
 EOF
+    /usr/bin/plutil -lint "$tmp" >/dev/null || { rm -f "$tmp"; die "Generated plist is invalid."; }
+    chown root:wheel "$tmp"; chmod 644 "$tmp"
+    mv -f "$tmp" "$daemonPlist"
+}
 
-chmod 644 /Library/LaunchDaemons/com.${companyName}.adminExpiryCheck.plist
-chown root:wheel /Library/LaunchDaemons/com.${companyName}.adminExpiryCheck.plist
+# (Re)install helper + daemon and confirm launchd really loaded it.
+arm_daemon() {
+    unlock_artifacts
+    /bin/launchctl bootout "system/$daemonLabel" 2>/dev/null
+    write_helper
+    write_daemon
+    /bin/launchctl bootstrap system "$daemonPlist" || return 1
+    /bin/launchctl print "system/$daemonLabel" >/dev/null 2>&1 || return 1
+    lock_artifacts
+    return 0
+}
 
-cat > "$persist_dir/checkAdminExpiry.sh" <<'EOF'
-#!/bin/bash
-
-expiryFile="$persist_dir/adminExpireAt"
-logFile="/Library/Logs/MakeMeAnAdmin/MakeMeAnAdminEvents.log"
-sudo_log="/var/log/sudo_admin.log"
-
-if [ -f "$expiryFile" ]; then
-  currentEpoch=$(date +%s)
-  expiryEpoch=$(cat "$expiryFile")
-  if [ "$currentEpoch" -ge "$expiryEpoch" ]; then
-    currentUser=$(/bin/ls -l /dev/console | /usr/bin/awk '{ print $3 }')
-
-    # Remove admin privileges
-    /usr/sbin/dseditgroup -o edit -d "$currentUser" -t user admin
-
-    # Log demotion event
-    timestamp=$(date -u "+%Y-%m-%d %H:%M:%S")
-    hostname=$(scutil --get LocalHostName)
-    event="demoted"
-
-    # Get elevation time (if available)
-    elevationTimestampFile="$persist_dir/adminStartTime"
-    if [ -f "$sudo_log" ] && [ -f "$elevationTimestampFile" ]; then
-      granted_at=$(cat "$elevationTimestampFile")
-      # Filter sudo log entries after elevation time (BSD awk friendly)
-      session_commands=$(awk -v user="$currentUser" -v start="$granted_at" '
-        $0 ~ user {
-          if (match($0, /[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
-            ts = substr($0, RSTART, RLENGTH)
-            gsub(/[-:]/, " ", ts)
-            split(ts, a, " ")
-            cmd_epoch = mktime(a[1] " " a[2] " " a[3] " " a[4] " " a[5] " " a[6])
-            if (cmd_epoch >= start) print $0
-          }
-        }' "$sudo_log" | tr '\n' ';')
-    else
-      session_commands=""
+setup_sudo_logging() {
+    # Command-only audit log. (Older versions also enabled log_input/log_output
+    # for every sudo user, which records typed secrets; that is removed.)
+    local want='Defaults logfile="/var/log/sudo_admin.log"' tmp
+    if [ "$(cat "$sudoersFile" 2>/dev/null)" != "$want" ]; then
+        tmp=$(mktemp "$persist_dir/.sudoers.XXXXXX") || return 1
+        echo "$want" > "$tmp"
+        if /usr/sbin/visudo -cf "$tmp" >/dev/null 2>&1; then
+            /usr/bin/install -m 440 -o root -g wheel "$tmp" "$sudoersFile"
+        else
+            say "WARN: sudoers logging snippet failed validation; not installed."
+        fi
+        rm -f "$tmp"
     fi
+    [ -f "$sudoLog" ] || touch "$sudoLog"
+    chown root:wheel "$sudoLog"; chmod 600 "$sudoLog"
+}
 
-    # Write to CSV log
-    if [ ! -f "$logFile" ]; then
-      echo "timestamp,hostname,user,event,duration,command" > "$logFile"
+#------------------------------------------------------------------------------
+# enforce mode (MDM backstop)
+#------------------------------------------------------------------------------
+if [ "$mode" = "enforce" ]; then
+    if [ ! -f "$stateFile" ]; then
+        # nothing granted; make sure no stale daemon is left behind
+        if [ -f "$daemonPlist" ] || [ -f "$helperScript" ]; then
+            say "enforce: no active grant; removing stale daemon files."
+            remove_artifacts
+        fi
+        exit 0
     fi
-    echo "$timestamp,$hostname,$currentUser,$event,,\"$session_commands\"" >> "$logFile"
-
-    # Clean up
-    rm -f "$expiryFile"
-    rm -f "$elevationTimestampFile"
-    rm -f $persist_dir/checkAdminExpiry.sh
-    rm -f /Library/LaunchDaemons/com.${companyName}.adminExpiryCheck.plist
-  fi
-fi
-EOF
-
-chmod +x "$persist_dir/checkAdminExpiry.sh"
-chown root:wheel "$persist_dir/checkAdminExpiry.sh"
-
-######################################################
-# write the script that will do the actual demotion  #
-# and then clean up the LaunchDaemon and itself      #
-######################################################
-
-cat > "$persist_dir/removeAdmin.sh" <<EOF
-#!/bin/bash
-/usr/sbin/dseditgroup -o edit -d $currentUser -t user admin
-rm /Library/LaunchDaemons/com.${companyName}.adminRemoval.plist
-rm $persist_dir/removeAdmin.sh
-EOF
-
-chmod +x "$persist_dir/removeAdmin.sh"
-chown root:wheel "$persist_dir/removeAdmin.sh"
-
-########################################################################
-# elevate user and record timestamp unload the daemon before loading   #
-########################################################################
-
-/usr/sbin/dseditgroup -o edit -a $currentUser -t user admin
-elevationTimestamp=$(date +%s)
-echo "$elevationTimestamp" > "$elevationTimestampFile"
-launchctl bootout system /Library/LaunchDaemons/com.${companyName}.adminExpiryCheck.plist 2>/dev/null
-launchctl bootstrap system /Library/LaunchDaemons/com.${companyName}.adminExpiryCheck.plist
-
-########################################################
-# Configure sudo logging (if not already configured)   #
-########################################################
-
-sudoers_log="/etc/sudoers.d/admin_logging"
-if [ ! -f "$sudoers_log" ]; then
-    echo 'Defaults logfile="/var/log/sudo_admin.log"' > "$sudoers_log"
-    echo 'Defaults log_input,log_output' >> "$sudoers_log"
-    chmod 440 "$sudoers_log"
+    user=$(state_get user)
+    if [ ! -f "$daemonPlist" ] || [ ! -f "$helperScript" ] || ! /bin/launchctl print "system/$daemonLabel" >/dev/null 2>&1; then
+        log_event "${user:-unknown}" "tamper-detected" "" "demotion daemon was missing or unloaded; re-arming"
+    fi
+    arm_daemon || die "enforce: could not re-arm the daemon."
+    /bin/bash "$helperScript"      # demotes right now if already expired
+    exit 0
 fi
 
-###############################
-# write to a log for tracking #
-###############################
+#------------------------------------------------------------------------------
+# request mode
+#------------------------------------------------------------------------------
+[ -n "$consoleUser" ] || die "No user is logged in at the console."
+verify_dialog || die "SwiftDialog (Team ID $dialogTeamID) is required but was not found or failed signature verification at '$dialogApp'. Deploy it with your MDM first."
+compute_layout
 
-timestamp=$(date -u "+%Y-%m-%d %H:%M:%S")
-hostname=$(scutil --get LocalHostName)
-event="elevated"
-logFile="/Library/Logs/MakeMeAnAdmin/MakeMeAnAdminEvents.log"
-if [ ! -f "$logFile" ]; then
-    echo "timestamp,hostname,user,event,duration,command" > "$logFile"
-fi
-
-echo "$timestamp,$hostname,$currentUser,$event,$timeChoice," >> "$logFile"
-
-archiveFile="/Library/Logs/MakeMeAnAdmin/MakeMeAnAdminEvents_Archive.csv"
-
-##############################
-# Archive if log exceeds 1MB #
-##############################
-
-if [ -f "$logFile" ]; then
-    fileSize=$(stat -f%z "$logFile")
-    if [ "$fileSize" -ge 1000000 ]; then
-        cat "$logFile" >> "$archiveFile"
-        echo "" > "$logFile"
+# Existing grant? Clear it if expired, otherwise refuse to extend it.
+if [ -f "$stateFile" ]; then
+    arm_daemon >/dev/null 2>&1
+    /bin/bash "$helperScript"                         # demotes now if expired
+    if [ -f "$stateFile" ]; then
+        remaining=$(( $(state_get expiry) - $(date +%s) ))
+        say "Request refused: a grant for $(state_get user) is already active."
+        show_message "You already have administrative rights.\n\nThey end at **$(format_expiry "$(state_get expiry)" "$remaining")**. A new request can be made after that."
+        exit 0
     fi
 fi
+
+if is_admin "$consoleUser"; then
+    say "$consoleUser is already an administrator; nothing to do."
+    show_message "Your account already has administrator rights, so no temporary access is needed."
+    exit 0
+fi
+
+choice=$(prompt_duration) || { say "User cancelled or the prompt timed out."; exit 0; }
+interval=$(duration_seconds "$choice") || die "Unexpected duration selection '$choice'."
+
+start=$(date +%s)
+expiry=$((start + interval))
+
+#------------------------------------------------------------------------------
+# Arm first, verify, THEN elevate. Any failure rolls the grant back.
+#------------------------------------------------------------------------------
+provisioning=1
+grantedUser="$consoleUser"
+
+sudoOffset=$(stat -f%z "$sudoLog" 2>/dev/null || echo 0)
+setup_sudo_logging
+sudoOffset=$(stat -f%z "$sudoLog" 2>/dev/null || echo "$sudoOffset")
+
+dscl . -read /Groups/admin GroupMembership 2>/dev/null | sed 's/^GroupMembership: *//' | tr ' ' '\n' | /usr/bin/grep -v '^$' | sort > "$snapshotFile"
+umask 077
+{
+    echo "user=$consoleUser"
+    echo "start=$start"
+    echo "expiry=$expiry"
+    echo "duration=$choice"
+    echo "sudoOffset=$sudoOffset"
+} > "$stateFile"
+echo "$start" > "$lastSeenFile"
+umask 022
+chown root:wheel "$stateFile" "$lastSeenFile" "$snapshotFile"; chmod 600 "$stateFile" "$lastSeenFile" "$snapshotFile"
+
+if ! arm_daemon; then
+    rollback
+    show_message "Admin access could not be set up, so nothing was changed. Please contact IT."
+    die "Could not arm the demotion daemon; rolled back."
+fi
+
+/usr/sbin/dseditgroup -o edit -a "$consoleUser" -t user admin
+if ! is_admin "$consoleUser"; then
+    rollback
+    show_message "Admin access could not be granted. Please contact IT."
+    die "dseditgroup did not add $consoleUser to admin; rolled back."
+fi
+
+provisioning=0   # fully armed and granted
+log_event "$consoleUser" "elevated" "$choice" ""
+
+show_message "You now have administrative rights until **$(format_expiry "$expiry" "$interval")** ($choice).\n\nAdministrative actions are logged and rights are removed automatically."
+exit 0
