@@ -34,11 +34,11 @@
             <key>companyName</key>
             <string>Acme</string>
 
-            <!-- https:// URL (PNG, JPG, GIF, SVG, PDF or TIFF) or an absolute path on the Mac. -->
+            <!-- https:// URL or absolute path to a PNG/JPEG: 64-2048 px, up to 750 KB, ratio 1:3 to 6:1. -->
             <key>companyLogo</key>
             <string>https://example.com/brand/logo.png</string>
 
-            <!-- Optional: used in Dark Mode (e.g. when the logo has dark text). Delete if unused. -->
+            <!-- Optional Dark Mode variant, same limits. Delete if unused. -->
             <key>companyLogoDark</key>
             <string>https://example.com/brand/logo-dark.png</string>
         </dict>
