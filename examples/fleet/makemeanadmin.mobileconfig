@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadDisplayName</key>
+    <string>MakeMeAnAdmin settings</string>
+    <key>PayloadDescription</key>
+    <string>Branding for the MakeMeAnAdmin temporary-admin prompt.</string>
+    <key>PayloadIdentifier</key>
+    <string>com.makemeanadmin.settings</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadScope</key>
+    <string>System</string>
+    <key>PayloadUUID</key>
+    <string>B12159AB-0528-4D7C-BE08-9B33159F4BC1</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadType</key>
+            <string>com.makemeanadmin</string>
+            <key>PayloadIdentifier</key>
+            <string>com.makemeanadmin.settings.config</string>
+            <key>PayloadUUID</key>
+            <string>B2604808-CA7B-461C-A175-87F3A1A5BD15</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>PayloadDisplayName</key>
+            <string>MakeMeAnAdmin preferences</string>
+
+            <!-- Letters, digits, '.', '_' and '-' only. Used in the LaunchDaemon label. -->
+            <key>companyName</key>
+            <string>Acme</string>
+
+            <!-- https:// URL (PNG, JPG, GIF, SVG, PDF or TIFF) or an absolute path on the Mac. -->
+            <key>companyLogo</key>
+            <string>https://example.com/brand/logo.png</string>
+
+            <!-- Optional: used in Dark Mode (e.g. when the logo has dark text). Delete if unused. -->
+            <key>companyLogoDark</key>
+            <string>https://example.com/brand/logo-dark.png</string>
+        </dict>
+    </array>
+</dict>
+</plist>

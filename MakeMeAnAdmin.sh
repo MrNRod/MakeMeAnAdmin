@@ -4,9 +4,10 @@
 # MakeMeAnAdmin (SwiftDialog Edition)
 #
 # Grants the logged-in standard user temporary admin rights, then removes them
-# automatically. Run as root from an MDM (Jamf Pro, Workspace ONE, ...).
+# automatically. Run as root from an MDM: Fleet (preferred), Jamf Pro,
+# Workspace ONE, ...
 #
-# Modes (first argument, or $8 / $mode):
+# Modes (first argument, $8, $mode, or defaultMode below):
 #   request   (default) prompt the user, grant admin, arm the demotion daemon
 #   enforce   MDM backstop: re-arm the daemon if it was tampered with and
 #             demote immediately if the grant has expired. Safe to run on a
@@ -24,20 +25,37 @@ set -u
 
 #------------------------------------------------------------------------------
 # Configuration
-# Order of precedence: MDM script parameter -> environment variable -> default
-# ($6 was "allowDialogInstall" in older versions; it is ignored now.)
+# Order of precedence:
+#   1. MDM script parameter ($4, $5, $7, $8)   - Jamf Pro
+#   2. environment variable                    - Workspace ONE, manual runs
+#   3. managed preference (configuration profile, domain com.makemeanadmin)
+#                                              - Fleet and any other MDM
+#   4. default below
+# Fleet cannot pass arguments to a script, so use (3) there. ($6 was
+# "allowDialogInstall" in older versions; it is ignored now.)
 #------------------------------------------------------------------------------
+defaultMode="request"        # the Fleet "enforce" copy changes just this line (see ReadMe.md)
+managedPrefs="/Library/Managed Preferences/com.makemeanadmin.plist"
+
+# Read one key from the MDM-managed preference file. Only trusted if it is
+# owned by root (users cannot write to /Library/Managed Preferences).
+managed_pref() {
+    [ -f "$managedPrefs" ] && [ "$(/usr/bin/stat -f%Su "$managedPrefs" 2>/dev/null)" = "root" ] || return 0
+    /usr/bin/plutil -extract "$1" raw -o - "$managedPrefs" 2>/dev/null
+}
+
 case "${1:-}" in
     request|enforce|preview) mode="$1" ;;
-    *) mode="${8:-${mode:-request}}" ;;
+    *) mode="${8:-${mode:-$defaultMode}}" ;;
 esac
-companyName="${4:-${companyName:-MrNRod}}"
-companyLogo="${5:-${companyLogo:-}}"
-companyLogoDark="${7:-${companyLogoDark:-}}"
+companyName="${4:-${companyName:-$(managed_pref companyName)}}"
+companyName="${companyName:-MrNRod}"
+companyLogo="${5:-${companyLogo:-$(managed_pref companyLogo)}}"
+companyLogoDark="${7:-${companyLogoDark:-$(managed_pref companyLogoDark)}}"
 
 durationOptions="30 minutes,1 hour,2 hours,4 hours,8 hours,1 day,1 week"
 defaultDuration="1 hour"
-promptTimeout=300            # seconds before an unanswered prompt closes
+promptTimeout=120            # seconds before an unanswered prompt closes (MDMs time scripts out)
 
 # SwiftDialog (required). Always called by absolute path inside the root-owned
 # app bundle - never via PATH or /usr/local/bin (which can be user-writable).
@@ -167,6 +185,40 @@ verify_dialog() {
 }
 
 #------------------------------------------------------------------------------
+# Remote logos (https only). MDMs like Fleet cannot ship a file alongside a
+# script, so a logo can be a URL. It is downloaded once, as the user, into a
+# private temp dir, and its type is checked by CONTENT before it is used.
+#------------------------------------------------------------------------------
+logoCache=""
+trap 'rm -rf "${logoCache:-}"' EXIT
+
+# Must run in the main shell (not in $(...)) so the cleanup trap sees logoCache.
+init_logo_cache() {
+    [ -n "$logoCache" ] && return 0
+    logoCache=$(mktemp -d /private/var/tmp/mma-logo.XXXXXX) || return 1
+    [ "$(id -u)" -eq 0 ] && chown "$consoleUser" "$logoCache"
+    chmod 700 "$logoCache"
+}
+
+# Runs inside $(...): messages go to stderr so only the path reaches stdout.
+fetch_logo() { # url index -> prints local path on success
+    local url="$1" n="$2" dl ext mime
+    [[ "$url" == https://* ]] || { say "WARN: only https:// logo URLs are allowed ('$url')." >&2; return 1; }
+    [ -n "$logoCache" ] || return 1
+    dl="$logoCache/logo$n.download"
+    run_as_user /usr/bin/curl -fsSL --proto '=https' --max-time 15 --max-filesize 5242880 -o "$dl" -- "$url" 2>/dev/null \
+        || { say "WARN: could not download logo '$url'." >&2; return 1; }
+    mime=$(run_as_user /usr/bin/file -b --mime-type "$dl" 2>/dev/null)
+    case "$mime" in
+        image/png) ext=png ;;  image/jpeg) ext=jpg ;;  image/gif) ext=gif ;;
+        image/svg+xml) ext=svg ;;  application/pdf) ext=pdf ;;  image/tiff) ext=tiff ;;
+        *) say "WARN: '$url' is not a supported image type ($mime)." >&2; return 1 ;;
+    esac
+    run_as_user /bin/mv -f "$dl" "$logoCache/logo$n.$ext" || return 1
+    echo "$logoCache/logo$n.$ext"
+}
+
+#------------------------------------------------------------------------------
 # Logo layout: choose icon size + window height from the logo's aspect ratio
 #------------------------------------------------------------------------------
 logo_arg=""      # value for --icon
@@ -174,12 +226,17 @@ logoSize=$logoUnknown
 logoHeight=$logoUnknown
 
 compute_layout() {
-    local logo="$companyLogo" w="" h="" raster=0 out vb
+    local logo="$companyLogo" dark="$companyLogoDark" w="" h="" raster=0 out
+
+    # remote logos become local files first, so they can be measured too
+    if [[ "$logo$dark" == *://* ]]; then init_logo_cache; fi
+    if [[ "$logo" == *://* ]]; then logo=$(fetch_logo "$logo" 1) || logo=""; fi
+    if [[ "$dark" == *://* ]]; then dark=$(fetch_logo "$dark" 2) || dark=""; fi
 
     # fall back to a built-in symbol if the logo is unset / unreadable by the user
     if [ -z "$logo" ]; then
         logo_arg="SF=lock.shield"
-    elif [[ "$logo" == http://* || "$logo" == https://* || "$logo" == SF=* ]]; then
+    elif [[ "$logo" == SF=* ]]; then
         logo_arg="$logo"
     elif run_as_user /bin/test -r "$logo" 2>/dev/null; then
         logo_arg="$logo"
@@ -193,8 +250,8 @@ compute_layout() {
     fi
 
     # optional dark-mode variant (SwiftDialog "light:dark=" syntax)
-    if [ -n "$companyLogoDark" ] && [ "$logo_arg" != "SF=lock.shield" ] && run_as_user /bin/test -r "$companyLogoDark" 2>/dev/null; then
-        logo_arg="${logo_arg}:dark=${companyLogoDark}"
+    if [ -n "$dark" ] && [ "$logo_arg" != "SF=lock.shield" ] && [[ "$logo_arg" != SF=* ]] && run_as_user /bin/test -r "$dark" 2>/dev/null; then
+        logo_arg="${logo_arg}:dark=${dark}"
     fi
 
     # Size: wide logos are limited by width, square/tall logos by height.
@@ -298,7 +355,7 @@ cleanup_exit() {
         say "Interrupted before the grant was fully armed - rolling back."
         rollback
     fi
-    rm -rf "$lockDir"
+    rm -rf "$lockDir" "${logoCache:-}"
 }
 trap cleanup_exit EXIT
 trap 'exit 1' INT TERM HUP
