@@ -222,7 +222,7 @@ compute_layout() {
 
 dialog_ui() { # extra dialog args...
     run_as_user "$dialogBin" \
-        --title "Make Me Admin" --titlefont size=25 \
+        --title "Make Me An Admin" --titlefont size=25 \
         --icon "$logo_arg" --iconsize "$logoSize" --iconalttext "$companyName logo" --centericon \
         --messagefont size=16 --alignment center \
         --width "$winWidth" --height "$winHeight" \
