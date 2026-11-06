@@ -19,8 +19,6 @@ A modernized, vendor-agnostic fork of [Jamf's MakeMeAnAdmin](https://github.com/
 
 ## Screenshot Preview
 
-> The screenshots below predate the current layout. Re-capture them with `./MakeMeAnAdmin.sh preview` (see [Previewing your branding](#previewing-your-branding)).
-
 ### Time Selection Prompt
 ![Time Selection](screenshots/prompt.png)
 
